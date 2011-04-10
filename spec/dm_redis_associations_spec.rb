@@ -15,7 +15,7 @@ describe DataMapper::Adapters::RedisAdapter do
       include DataMapper::Resource
 
       property :id,   Serial
-      property :name, String
+      property :name, String, :index => true
 
       has n, :book_tags
       has n, :tags, :through => :book_tags

@@ -144,50 +144,58 @@ module DataMapper
       # @api private
       def records_for(query)
         keys = []
-
-        query.conditions.operands.select {|o| o.is_a?(DataMapper::Query::Conditions::EqualToComparison)}.each do |o|
-          if query.model.key.include?(o.subject)
-            if @redis.sismember(key_set_for(query.model), o.value)
-              keys << {"#{redis_key_for(query.model)}" => o.value}
-            end
+        q = []
+        q.push query.conditions.operands
+        until q.empty?
+          operands = q.pop
+          operands.select {|o| o.respond_to?(:operands)}.each do |o|
+            q.push o.operands
           end
-
-          if o.subject.is_a?(DataMapper::Associations::ManyToOne::Relationship)
-            if @redis.sismember("#{o.subject.child_model.to_s.downcase}:#{o.subject.child_key.first.name}:#{encode(o.value[o.subject.parent_key.first.name])}", o.value[o.subject.parent_key.first.name])
-              keys << {o.subject.parent_key.first.name.to_s => o.value[o.subject.parent_key.first.name]}
-            end
-          end
-
-          find_matches(query, o).each do |k|
-            keys << {"#{redis_key_for(query.model)}" => k.to_i, "#{o.subject.name}" => o.value}
-          end
-        end
-        
-
-        query.conditions.operands.select {|o| o.is_a?(DataMapper::Query::Conditions::InclusionComparison)}.each do |o|
-          # Hope its a relationship so we can use the lookup
-          if o.subject.is_a?(DataMapper::Associations::ManyToOne::Relationship)
-            o.value.each do |value|
-              key = value[o.subject.parent_key.first.name]
-              if @redis.sismember("#{o.subject.child_model.to_s.downcase}:#{o.subject.child_key.first.name}:#{encode(key)}", key)
-                keys << {o.subject.parent_key.first.name.to_s => key}
+          operands.select {|o| o.is_a?(DataMapper::Query::Conditions::EqualToComparison)}.each do |o|
+            # searching for a specific ID?
+            if query.model.key.include?(o.subject)
+              if @redis.sismember(key_set_for(query.model), o.value) ^ o.negated?
+                keys << {"#{redis_key_for(query.model)}" => o.value}
               end
             end
-          elsif o.subject.is_a?(DataMapper::Associations::ManyToMany::Relationship)
-            o.value.each do |value|
-              child_key = value[o.subject.parent_key.first.name]
-              # For each join model pointing to the child
-              @redis.smembers("#{o.subject.via.child_model.to_s.downcase}:#{o.subject.via.child_key.first.name}:#{encode(child_key)}").each do |via|             
-                hash_key = "#{o.subject.via.child_model_name.to_s.downcase}:#{via}"
-                keys << {o.subject.parent_key.first.name.to_s => @redis.hget(hash_key, o.subject.through.child_key.first.name)}
+
+            if o.subject.is_a?(DataMapper::Associations::ManyToOne::Relationship)
+              if @redis.sismember("#{o.subject.child_model.to_s.downcase}:#{o.subject.child_key.first.name}:#{encode(o.value[o.subject.parent_key.first.name])}", o.value[o.subject.parent_key.first.name]) ^ o.negated?
+                keys << {o.subject.parent_key.first.name.to_s => o.value[o.subject.parent_key.first.name]}
               end
             end
-          else
-            @redis.smembers(key_set_for(query.model)).each do |key|
-              hash_key = "#{query.model.to_s.downcase}:#{key}"
-              debugger unless o.subject.respond_to?(:typecast)
-              if (o.value).include?(o.subject.typecast(@redis.hget(hash_key, o.subject.name)))
-                keys << {"#{redis_key_for(query.model)}" => key.to_i}
+
+            find_matches(query, o).each do |k|
+              keys << {"#{redis_key_for(query.model)}" => k.to_i, "#{o.subject.name}" => o.value}
+            end
+          end
+
+
+          operands.select {|o| o.is_a?(DataMapper::Query::Conditions::InclusionComparison)}.each do |o|
+            # Hope its a relationship so we can use the lookup
+            if o.subject.is_a?(DataMapper::Associations::ManyToOne::Relationship)
+              o.value.each do |value|
+                key = value[o.subject.parent_key.first.name]
+                if @redis.sismember("#{o.subject.child_model.to_s.downcase}:#{o.subject.child_key.first.name}:#{encode(key)}", key)
+                  keys << {o.subject.parent_key.first.name.to_s => key}
+                end
+              end
+            elsif o.subject.is_a?(DataMapper::Associations::ManyToMany::Relationship)
+              o.value.each do |value|
+                child_key = value[o.subject.parent_key.first.name]
+                # For each join model pointing to the child
+                @redis.smembers("#{o.subject.via.child_model.to_s.downcase}:#{o.subject.via.child_key.first.name}:#{encode(child_key)}").each do |via|
+                  hash_key = "#{o.subject.via.child_model_name.to_s.downcase}:#{via}"
+                  keys << {o.subject.parent_key.first.name.to_s => @redis.hget(hash_key, o.subject.through.child_key.first.name)}
+                end
+              end
+            else
+              @redis.smembers(key_set_for(query.model)).each do |key|
+                hash_key = "#{query.model.to_s.downcase}:#{key}"
+                debugger unless o.subject.respond_to?(:typecast)
+                if (o.value).include?(o.subject.typecast(@redis.hget(hash_key, o.subject.name)))
+                  keys << {"#{redis_key_for(query.model)}" => key.to_i}
+                end
               end
             end
           end
@@ -241,7 +249,12 @@ module DataMapper
       #   Array of id's of all members matching the query
       # @api private
       def find_matches(query, operand)
-        @redis.smembers("#{query.model.to_s.downcase}:#{operand.subject.name}:#{encode(operand.value.to_s)}")
+        index_set = "#{query.model.to_s.downcase}:#{operand.subject.name}:#{encode(operand.value.to_s)}"
+        unless operand.negated?
+          @redis.smembers(index_set)
+        else
+          @redis.sdiff(key_set_for(query.model), index_set)
+        end
       end
 
       ##
