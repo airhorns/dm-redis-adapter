@@ -1,13 +1,19 @@
 require File.expand_path("../spec_helper", __FILE__)
 require 'dm-core'
 require 'dm-redis-adapter/spec/setup'
+require 'dm-validations'
+require 'dm-migrations'
 
 describe DataMapper::Adapters::RedisAdapter do
   before(:all) do
-    @adapter = DataMapper.setup(:default, {
+
+    DataMapper.setup(:default, {
       :adapter  => "redis",
       :db => 15
     })
+
+    DataMapper::Model.raise_on_save_failure = true
+
     redis = Redis.new(:db => 15)
     redis.flushdb
 
@@ -35,32 +41,49 @@ describe DataMapper::Adapters::RedisAdapter do
       include DataMapper::Resource
 
       property :id,   Serial
-      # property :book_id, Integer, :index => true
-      # property :tag_id,  Integer, :index => true
 
       belongs_to :book
       belongs_to :tag
     end
 
+    DataMapper.finalize
+    DataMapper.auto_migrate!
+
     @b = Book.create(:name => "Harry Potter")
     @t = Tag.create(:name => "fiction")
-
+    @t2 = Tag.create(:name => "wizards")
+    
     @b.tags << @t
+    @b.tags << @t2
     @b.save
+    
+
+    @b2 = Book.create(:name => "A Series of Unfortunate Events")
+    @t3 = Tag.create(:name => "olaf")
+
+    @b2.tags << @t
+    @b2.tags << @t3
+    @b2.save
   end
 
   it "should allow has n :through" do
+    #b2 = Book.get(1)
+    #b2.tags.should == [@t,@t2]
+    debugger
     b2 = Book.get(1)
-    b2.tags.should == [@t]
+    b2.tags.should == [@t,@t3]
   end
-  
+
   it "should allow inclusion in operators for belongs_to" do
     BookTag.first(:book => [@b]).should be
   end
 
   it "should allow inclusion in operators" do
-    [Book.first(:name => ["Harry Potter"]), Book.first(:tags => [@t])].each do |b2|
-      b2.should == @b
-    end
+    Book.first(:name => ["Harry Potter"]).should == @b
+  end
+
+  it "should allow inclusion in operators for associations" do
+    BookTag.first(:tag => [@t]).book.should == @b
+    BookTag.all(:tag => [@t]).to_a.map {|x| x.book}.should == [@b,@b2]
   end
 end

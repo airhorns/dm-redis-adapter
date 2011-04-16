@@ -4,6 +4,7 @@ require 'base64'
 module DataMapper
   module Adapters
     class RedisAdapter < AbstractAdapter
+      include DataMapper::Query::Conditions
       ##
       # Used by DataMapper to put records into the redis data-store: "INSERT" in SQL-speak.
       # It takes an array of the resources (model instances) to be saved. Resources
@@ -35,14 +36,13 @@ module DataMapper
       #
       # @api semipublic
       def read(query)
-        records_for(query).each do |record|
-          record_data = @redis.hgetall("#{query.model.to_s.downcase}:#{record[redis_key_for(query.model)]}")
-
+        fetched = records_for(query).map do |record|
+          # Fetch stuff in hash about the actual record
+          record.merge! @redis.hgetall("#{query.model.to_s.downcase}:#{query.model.key.map{|x| record[x.name.to_s]}.join(":")}")
+        
           query.fields.each do |property|
-            next if query.model.key.include?(property)
-
             name = property.name.to_s
-            value = record_data[name]
+            value = record[name]
 
             # Integers are stored as Strings in Redis. If there's a
             # string coming out that should be an integer, convert it
@@ -50,9 +50,12 @@ module DataMapper
             # separately.
             record[name] = [Integer, Date].include?(property.primitive) ? property.typecast( value ) : value
           end
+          record
         end
+        query.filter_records(fetched)
+        fetched
       end
-
+        
       ##
       # Used by DataMapper to update the attributes on existing records in the redis
       # data-store: "UPDATE" in SQL-speak. It takes a hash of the attributes
@@ -89,7 +92,8 @@ module DataMapper
           record = collection[x]
           @redis.del("#{collection.query.model.to_s.downcase}:#{record[redis_key_for(collection.query.model)]}")
           @redis.srem(key_set_for(collection.query.model), record[redis_key_for(collection.query.model)])
-          record.model.properties.select {|p| p.index}.each do |p|
+
+          indexed_properties(record.model).each do |p|
             @redis.srem("#{collection.query.model.to_s.downcase}:#{p.name}:#{encode(record[p.name])}", record[redis_key_for(collection.query.model)])
           end
         end
@@ -109,8 +113,8 @@ module DataMapper
           model = resource.model
           attributes = resource.dirty_attributes
 
-          resource.model.properties.select {|p| p.index}.each do |property|
-            @redis.sadd("#{resource.model.to_s.downcase}:#{property.name}:#{encode(resource[property.name.to_s])}", resource.key.first.to_s)
+          indexed_properties(model).each do |property|
+            @redis.sadd(index_key_set_for(model, property.name, resource[property.name.to_s]), resource.key.join(":").to_s)
           end
 
           properties_to_set = []
@@ -126,120 +130,114 @@ module DataMapper
             end
           end
 
-          hash_key = "#{resource.model.to_s.downcase}:#{resource.key.join}"
+          hash_key = "#{model.to_s.downcase}:#{resource.key.join(":")}"
           properties_to_del.each {|prop| @redis.hdel(hash_key, prop) }
           @redis.hmset(hash_key, *properties_to_set) unless properties_to_set.empty?
         end
       end
-
-      ##
-      # Retrieves records for a particular model.
-      #
-      # @param [DataMapper::Query] query
-      #   The query used to locate the resources
-      #
-      # @return [Array]
-      #   An array of hashes of all of the records for a particular model
-      #
-      # @api private
+      
       def records_for(query)
-        keys = []
-        q = []
-        q.push query.conditions.operands
-        until q.empty?
-          operands = q.pop
-          operands.select {|o| o.respond_to?(:operands)}.each do |o|
-            q.push o.operands
+        keys_for(query).map do |record_key_value|
+          record = {}
+          keys = record_key_value.to_s.split(":")
+          query.model.key.to_a.each_with_index do |x, i|
+            record[x.name.to_s] = keys[i]
           end
-          operands.select {|o| o.is_a?(DataMapper::Query::Conditions::EqualToComparison)}.each do |o|
-            # searching for a specific ID?
-            if query.model.key.include?(o.subject)
-              if @redis.sismember(key_set_for(query.model), o.value) ^ o.negated?
-                keys << {"#{redis_key_for(query.model)}" => o.value}
-              end
-            end
-
-            if o.subject.is_a?(DataMapper::Associations::ManyToOne::Relationship)
-              if @redis.sismember("#{o.subject.child_model.to_s.downcase}:#{o.subject.child_key.first.name}:#{encode(o.value[o.subject.parent_key.first.name])}", o.value[o.subject.parent_key.first.name]) ^ o.negated?
-                keys << {o.subject.parent_key.first.name.to_s => o.value[o.subject.parent_key.first.name]}
-              end
-            end
-
-            find_matches(query, o).each do |k|
-              keys << {"#{redis_key_for(query.model)}" => k.to_i, "#{o.subject.name}" => o.value}
-            end
-          end
-
-
-          operands.select {|o| o.is_a?(DataMapper::Query::Conditions::InclusionComparison)}.each do |o|
-            # Hope its a relationship so we can use the lookup
-            if o.subject.is_a?(DataMapper::Associations::ManyToOne::Relationship)
-              o.value.each do |value|
-                key = value[o.subject.parent_key.first.name]
-                if @redis.sismember("#{o.subject.child_model.to_s.downcase}:#{o.subject.child_key.first.name}:#{encode(key)}", key)
-                  keys << {o.subject.parent_key.first.name.to_s => key}
-                end
-              end
-            elsif o.subject.is_a?(DataMapper::Associations::ManyToMany::Relationship)
-              o.value.each do |value|
-                child_key = value[o.subject.parent_key.first.name]
-                # For each join model pointing to the child
-                @redis.smembers("#{o.subject.via.child_model.to_s.downcase}:#{o.subject.via.child_key.first.name}:#{encode(child_key)}").each do |via|
-                  hash_key = "#{o.subject.via.child_model_name.to_s.downcase}:#{via}"
-                  keys << {o.subject.parent_key.first.name.to_s => @redis.hget(hash_key, o.subject.through.child_key.first.name)}
-                end
-              end
-            else
-              @redis.smembers(key_set_for(query.model)).each do |key|
-                hash_key = "#{query.model.to_s.downcase}:#{key}"
-                debugger unless o.subject.respond_to?(:typecast)
-                if (o.value).include?(o.subject.typecast(@redis.hget(hash_key, o.subject.name)))
-                  keys << {"#{redis_key_for(query.model)}" => key.to_i}
-                end
-              end
-            end
-          end
+          record
         end
-
-        if keys.empty? && (query.order || query.limit)
+      end        
+      ##
+      #
+      #
+      #
+      #
+      #
+      def keys_for(query)
+        if query.conditions.empty?
+          keys = []
           params = {}
           params[:limit] = [query.offset, query.limit] if query.limit
 
           if query.order && !query.order.empty?
             order = query.order.first
             params[:order] = order.operator.to_s
+          else
+            params[:order] = "nosort"
           end
 
           @redis.sort(key_set_for(query.model), params).each do |val|
-            keys << {"#{redis_key_for(query.model)}" => val.to_i}
+            keys << val.to_i
           end
+          keys
+        else
+          keys = keys_for_conditions(query)
+          if keys.nil?
+            keys = @redis.smembers(key_set_for(query.model))
+          end
+          keys
         end
-
-        keys
       end
 
       ##
-      # Creates a string representation for the keys in a given model
+      # Returns the set of keys matching a comparison in a query's conditions
       #
-      # @param [DataMapper::Model] model
-      #   The query used to locate the resources to be deleted.
+      # @params [DataMapper::AbstractComparison]
+      #  The comparison operator used in the conditions
       #
-      # @return [String]
-      #   A string representation of the string key for this model
+      # @return [Array]
+      #  The list of keys to fetch which match this compariso}
       #
       # @api private
-      def redis_key_for(model)
-        model.key.collect {|k| k.name}.join(":")
+      def keys_for_conditions(query, condition = nil)
+        condition ||= query.conditions
+        case condition
+        when nil then @redis.smembers(key_set_for(query.model))
+        when AbstractOperation then keys_for_operation(query, condition)
+        when AbstractComparison then keys_for_comparison(query, condition)
+        else 
+          debugger
+          raise NotImplementedError
+        end
       end
 
-      ##
-      # Return the key string for the set that contains all keys for a particular resource
-      #
-      # @return String
-      #   The string key for the :all set
-      # @api private
-      def key_set_for(model)
-        "#{model.to_s.downcase}:#{redis_key_for(model)}:all"
+      def keys_for_operation(query, operation)
+        case operation
+        when NotOperation then keys_for_conditions(query, operation.first)
+        when AndOperation then 
+          keys = operation.operands.map {|op| keys_for_conditions(query, op)}
+          if keys.any? {|x| x.nil? }
+            nil
+          else
+            keys.reduce {|acc, keys| acc & keys}
+          end
+        when OrOperation then
+        else
+          debugger
+          raise NotImplementedError
+        end
+      end
+
+      def keys_for_comparison(query, comparison)
+        case comparison
+        when EqualToComparison then
+          _get_keys_for_comparison(query, comparison, comparison.value)
+        when InclusionComparison then
+          comparison.value.map do |value|
+            keys = _get_keys_for_comparison(query, comparison, value)
+            return nil if keys.nil?
+            keys
+          end.flatten
+        else
+          raise NotImplementedError
+        end
+      end
+      
+      def _get_keys_for_comparison(query, comparison, value) 
+        if comparison.relationship?
+          find_relationship_matches(query, comparison, value)
+        else
+          find_property_index_matches(query, comparison, value)
+        end
       end
 
       ##
@@ -258,6 +256,103 @@ module DataMapper
       end
 
       ##
+      # Find a matching entry for a query
+      #
+      # @return [Array]
+      #   Array of id's of all members matching the query
+      # @api private
+      def find_property_index_matches(query, comparison, value)
+        # Check for key based comparisons which are automatically indexed.
+        if query.model.key.include?(comparison.subject)
+          if @redis.sismember(key_set_for(query.model), value)
+            affirmative = [value]
+          end
+
+          unless comparison.negated?
+            return affirmative
+          else
+            return @redis.smembers(key_set_for(query.model)) - affirmative
+          end
+        end
+
+        # Otherwise, check for :index => true on simple fields
+        index_set = index_key_set_for(query.model, comparison.subject.name, value)
+ 
+        # If this set doesn't exist, redis can't say, we do it in memory later
+        return nil unless @redis.exists(index_set)
+
+        unless comparison.negated?
+          matches = @redis.smembers(index_set)
+        else
+          matches = @redis.sdiff(key_set_for(query.model), index_set)
+        end
+      end
+      
+
+      ## Finds ids based on a relationship comparison
+      def find_relationship_matches(query, comparison, value)
+        relationship = comparison.subject
+        case relationship
+          when DataMapper::Associations::ManyToOne::Relationship then
+            # We're searching for an index on the child model. The redis set stores a list of the child models which
+            # reference a particular parent, and encodes the *value* of the parent's key in the redis key of the set. Phew.
+            child_foreign_key = relationship.child_key.map {|x| x.name }.join(":")
+            parent_value = relationship.parent_key.map {|x| value[x.name]}.join(":")
+            
+            # The set of children who point to the parent
+            affirmative_set = index_key_set_for(relationship.child_model, child_foreign_key, parent_value)
+
+            # If this set doesn't exist, we can't do much, do it in memory later
+            return nil unless @redis.exists(affirmative_set)
+
+            # If the set does exist, return it for normal comparisons, and all children without the set for negated comparisons
+            unless comparison.negated?
+              return @redis.smembers(affirmative_set)
+            else
+              return @redis.sdiff(affirmative_set, key_set_for(relationship.child_model))
+            end
+          when DataMapper::Associations::ManyToMany::Relationship then
+            # We're searching for an index on the child model
+            child_foreign_key = relationship.child_key.map {|x| x.name }.join(":")
+            # For each join model pointing to the child
+            @redis.smembers("#{o.subject.via.child_model.to_s.downcase}:#{o.subject.via.child_key.first.name}:#{encode(child_key)}").each do |via|
+              hash_key = "#{o.subject.via.child_model_name.to_s.downcase}:#{via}"
+              keys << {o.subject.parent_key.first.name.to_s => @redis.hget(hash_key, o.subject.through.child_key.first.name)}
+            end
+          else
+            raise NotImplemented
+          end
+      end
+
+      ##
+      # Creates a string representation for the keys in a given model
+      #
+      # @param [DataMapper::Model] model
+      #   The query used to locate the resources to be deleted.
+      #
+      # @return [String]
+      #   A string representation of the string key for this model
+      #)
+      # @api private
+      def redis_key_for(model)
+        model.key.collect {|k| k.name}.join(":")
+      end
+      
+      ##
+      # Return the key string for the set that contains all keys for a particular resource
+      #
+      # @return String
+      #   The string key for the :all set
+      # @api private
+      def key_set_for(model)
+        "#{model.to_s.downcase}:#{redis_key_for(model)}:all"
+      end
+      
+      def index_key_set_for(model, field, value)
+        "#{model.to_s.downcase}:#{field}:#{encode(value)}"
+      end
+
+      ##
       # Base64 encode a value as a string key for an index
       #
       # @return String
@@ -265,6 +360,13 @@ module DataMapper
       # @api private
       def encode(value)
         Base64.encode64(value.to_s).gsub("\n", "")
+      end
+      
+      ##
+      # Get properties on a model which have indexes
+      def indexed_properties(model)
+        #model.properties.select {|p| p.index }
+        model.properties
       end
 
       ##
