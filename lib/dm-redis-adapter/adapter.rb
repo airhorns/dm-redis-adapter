@@ -53,7 +53,6 @@ module DataMapper
           record
         end
         query.filter_records(fetched)
-        fetched
       end
         
       ##
@@ -195,7 +194,6 @@ module DataMapper
         when AbstractOperation then keys_for_operation(query, condition)
         when AbstractComparison then keys_for_comparison(query, condition)
         else 
-          debugger
           raise NotImplementedError
         end
       end
@@ -212,7 +210,6 @@ module DataMapper
           end
         when OrOperation then
         else
-          debugger
           raise NotImplementedError
         end
       end
@@ -222,11 +219,21 @@ module DataMapper
         when EqualToComparison then
           _get_keys_for_comparison(query, comparison, comparison.value)
         when InclusionComparison then
-          comparison.value.map do |value|
-            keys = _get_keys_for_comparison(query, comparison, value)
-            return nil if keys.nil?
-            keys
-          end.flatten
+          if comparison.value.count == 0
+            if comparison.negated?
+              return @redis.smembers(key_set_for(comparison.subject.model))
+            else
+              return []
+            end
+          else
+            comparison.value.map do |value|
+              keys = _get_keys_for_comparison(query, comparison, value)
+              return nil if keys.nil?
+              keys
+            end.flatten
+          end
+        when LikeComparison, RegexpComparison, GreaterThanComparison, GreaterThanOrEqualToComparison, LessThanComparison, LessThanOrEqualToComparison then
+          return nil
         else
           raise NotImplementedError
         end
@@ -266,6 +273,8 @@ module DataMapper
         if query.model.key.include?(comparison.subject)
           if @redis.sismember(key_set_for(query.model), value)
             affirmative = [value]
+          else
+            affirmative = []
           end
 
           unless comparison.negated?
